@@ -4,6 +4,19 @@
 
 > What one AI learns, all your AIs know. Claude, GPT, Gemini, local models — same memory, one endpoint.
 
+## Memory crossover
+
+Your AI at **home** and your AI at **work** share the **same memory**. Tell Claude
+something tonight, and tomorrow GPT at the office already knows it. Memory isn't
+trapped inside one model or one machine — it lives in your project's cube, and any
+LLM you connect (via SDK or MCP) reads and writes the same persistent context.
+
+```
+  Claude (home)  ─┐
+  GPT (work)     ─┼──►  one Cube Memory project  ◄── shared, persistent, semantic
+  Gemini (phone) ─┘
+```
+
 [![Get a free key](https://img.shields.io/badge/get-free%20key-6366f1)](https://cubememory.com.br)
 [![MCP](https://img.shields.io/badge/MCP-native-06b6d4)](https://cubememory.com.br)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
