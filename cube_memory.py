@@ -135,3 +135,84 @@ class Memory:
 
     def __repr__(self):
         return f"Memory(project={self._pid!r})"
+
+
+class Notes:
+    """
+    PKM notes with automatic heading-chunking and semantic search.
+
+    Notes are stored as markdown, chunked by heading (#, ##, ###) on the server,
+    and encrypted at rest. Search returns the exact heading section that matched.
+
+        from cube_memory import Notes
+        notes = Notes(api_key="cm_live_...", project="proj_...")
+        notes.save(title="Auth design", text="# Tokens\nWe use JWT...")
+        hits = notes.search("how do we authenticate?")
+        print(hits[0]["matched_section"])
+    """
+
+    def __init__(self, api_key: str, project: str, base_url: str = _BASE):
+        self._base = base_url.rstrip("/")
+        self._h = {
+            "Authorization": f"Bearer {api_key}",
+            "X-Project-Id":  project,
+            "Content-Type":  "application/json",
+        }
+
+    @staticmethod
+    def _md_to_doc(text: str) -> dict:
+        """Markdown → minimal TipTap doc so the server can chunk by heading."""
+        content = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("#"):
+                level = len(s) - len(s.lstrip("#"))
+                content.append({"type": "heading", "attrs": {"level": min(level, 3)},
+                                "content": [{"type": "text", "text": s.lstrip("#").strip()}]})
+            else:
+                content.append({"type": "paragraph",
+                                "content": [{"type": "text", "text": s}]})
+        return {"type": "doc", "content": content}
+
+    def save(self, title: str, text: str, tags: Optional[list] = None,
+             note_id: Optional[str] = None) -> str:
+        """Save a markdown note. Headings become searchable chunks. Returns the note ID."""
+        body = {"title": title, "text": text,
+                "tiptap_json": json.dumps(self._md_to_doc(text)), "tags": tags or []}
+        if note_id:
+            body["id"] = note_id
+        r = _req.post(f"{self._base}/v1/notes", headers=self._h, json=body, timeout=20)
+        r.raise_for_status()
+        return r.json()["id"]
+
+    def search(self, query: str, limit: int = 10):
+        """
+        Semantic search across note chunks. Each result includes 'matched_section'
+        — the heading where the match was found — plus 'title', 'score', 'tags'.
+        """
+        r = _req.post(f"{self._base}/v1/notes/search", headers=self._h,
+                      json={"query": query, "limit": limit}, timeout=15)
+        r.raise_for_status()
+        return r.json().get("results", [])
+
+    def get(self, note_id: str):
+        """Load a full note by ID (includes 'related_notes' AI auto-links)."""
+        r = _req.get(f"{self._base}/v1/notes/{note_id}", headers=self._h, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def list(self, limit: int = 50):
+        """List all notes, newest first."""
+        r = _req.get(f"{self._base}/v1/notes", headers=self._h, timeout=15)
+        r.raise_for_status()
+        return r.json().get("notes", [])[:limit]
+
+    def delete(self, note_id: str) -> bool:
+        """Delete a note and its chunks by ID."""
+        r = _req.delete(f"{self._base}/v1/notes/{note_id}", headers=self._h, timeout=15)
+        return r.status_code in (200, 404)
+
+    def __repr__(self):
+        return "Notes(cube-memory)"
