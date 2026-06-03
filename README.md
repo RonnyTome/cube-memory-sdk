@@ -43,6 +43,26 @@ mem.remember("user prefers JWT over sessions")
 
 Get your free key at **[cubememory.com.br](https://cubememory.com.br)** (100k vectors free).
 
+## PKM Notes (Personal Knowledge Management)
+
+Beyond transactional memory, the SDK includes a full PKM Notes system with automatic heading-chunking, vector search, and AI auto-linking.
+
+```python
+from cube_memory import Notes
+
+notes = Notes(api_key="cm_live_...", project="proj_...")
+
+# Save a markdown note (it automatically chunks by headings and encrypts via AES-256)
+notes.save(
+    title="Zero-Knowledge Architecture",
+    text="Data is encrypted at rest using a project-specific DEK..."
+)
+
+# Semantic search across all note chunks
+results = notes.search("How is data encrypted?")
+print(results[0]["matched_section"]) # Returns the specific heading where it found the answer
+```
+
 ## Connect any AI via MCP — zero local setup
 
 Drop this into your Claude Code / Cursor / Windsurf `.mcp.json`:
