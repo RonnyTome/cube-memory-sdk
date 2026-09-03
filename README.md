@@ -115,7 +115,7 @@ reply = mem.chat(
 ## Files
 
 - [`cube_memory.py`](cube_memory.py) — the client (only dependency: `requests`)
-- [`cube_memory_mcp.py`](cube_memory_mcp.py) — stdio MCP server for local clients
+- [`cube_memory_mcp.py`](cube_memory_mcp.py) — stdio MCP server for local clients. **Standard library only** (urllib) — no dependencies, and nothing is installed at import time. Tools: `search_memory`, `fetch_memory`, `store_memory`, `list_memory`, `forget_memory` (`list_memories` is accepted as an alias). Note this is a different surface from the hosted `/v1/mcp` endpoint above, which exposes `search_memory`, `store_memory`, `list_memories`, `search_notes`, `get_note`.
 - [`examples/`](examples/) — OpenAI, Anthropic, and MCP setup
 
 ## Benchmark
