@@ -218,3 +218,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# sync-pipeline smoke test 2026-09-03T10:45:03Z
