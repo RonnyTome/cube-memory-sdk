@@ -46,6 +46,24 @@ API_KEY = os.getenv("CM_API_KEY") or os.getenv("OMNIBUS_API_KEY", "")
 PID     = os.getenv("CM_PROJECT_ID") or os.getenv("CUBE_PROJECT_ID", "")
 TIMEOUT = float(os.getenv("CM_TIMEOUT", "30"))
 
+# Fallback: config.json gravado pelo instalador (install.sh / install.ps1).
+# Caminhos: Linux/macOS ~/.cube-memory/config.json ; Windows %USERPROFILE%\.cube-memory\config.json
+if (not API_KEY or not PID):
+    _CFG = {}
+    try:
+        _p = os.path.expanduser("~/.cube-memory/config.json")
+        if os.path.exists(_p):
+            with open(_p, encoding="utf-8") as _f:
+                _CFG = json.load(_f)
+    except Exception:
+        _CFG = {}
+    if not API_KEY:
+        API_KEY = _CFG.get("api_key", "")
+    if not PID:
+        PID = _CFG.get("project_id", "")
+    if not BASE.startswith("http") and _CFG.get("base_url"):
+        BASE = _CFG["base_url"]
+
 TOOLS = [
     {"name": "search_memory",
      "description": "Recall relevant memories before responding. Call this first with the user's message.",
