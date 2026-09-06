@@ -30,18 +30,23 @@ Or the hosted endpoint, no local file:
   }
 
 Tools: search_memory, fetch_memory, store_memory, list_memory, forget_memory,
-       search_code, map_code, get_symbol.
+       search_code, map_code, get_symbol, get_symbol_refs.
 `list_memories` is accepted as an alias of `list_memory` for backward
 compatibility with builds of this file published before 2026-09-03.
 
-Code layer (v1.2): the project's code can be ingested server-side (per-symbol
-parse) and queried with search_code / map_code / get_symbol. Freshness without
+Code layer (v1.3): the project's code can be ingested server-side (per-symbol
+parse) and queried with search_code / map_code / get_symbol. get_symbol_refs
+adds RELATIONSHIPS between symbols (who uses/calls a symbol, cross-file, with
+line + snippet) — IDE "find references" on top of the index. Freshness without
 GitHub sync:
   - `python3 cube_memory_mcp.py sync` — delta-ingest: hashes every code file
     under CM_CODE_ROOT, asks the server what changed, re-ingests only that.
     Wire it to a SessionStart hook to keep the index always fresh.
-  - map_code / get_symbol self-heal: if CM_CODE_ROOT is set and the local file
-    differs from what was indexed, that one file is re-ingested before answering.
+    Auto-root: if CM_CODE_ROOT is not set, the git repo root of the current
+    directory is used automatically (no manual setup needed).
+  - map_code / get_symbol / get_symbol_refs self-heal: if CM_CODE_ROOT is set
+    and the local file differs from what was indexed, that one file is
+    re-ingested before answering.
   - every code answer carries the indexing age; stale ones are flagged.
 """
 import hashlib
@@ -111,9 +116,14 @@ TOOLS = [
      "inputSchema": {"type": "object",
                      "properties": {"limit": {"type": "integer", "default": 20}}}},
     {"name": "forget_memory",
-     "description": "Delete a specific memory by id.",
+     "description": "Close a memory's validity by id (soft): it stops showing up "
+                    "in recall but stays readable by id for audit. Not a physical "
+                    "delete.",
      "inputSchema": {"type": "object",
-                     "properties": {"id": {"type": "string"}},
+                     "properties": {"id": {"type": "string"},
+                                    "motivo": {"type": "string",
+                                               "description": "corrigida|refutada|obsoleta|duplicada|removida",
+                                               "default": "removida"}},
                      "required": ["id"]}},
     {"name": "search_code",
      "description": "Semantic search inside the project's ingested code symbols "
@@ -140,6 +150,20 @@ TOOLS = [
      "inputSchema": {"type": "object",
                      "properties": {"path": {"type": "string"},
                                     "simbolo": {"type": "string"}},
+                     "required": ["path", "simbolo"]}},
+    {"name": "get_symbol_refs",
+     "description": "RELATIONSHIPS between symbols: who uses/calls/references a "
+                    "given symbol across the whole project (cross-file). Returns "
+                    "every usage point with file, exact line and the code snippet "
+                    "of that line - like IDE 'find references'. Use when "
+                    "refactoring, renaming, or understanding impact: 'who calls "
+                    "foo?', 'where is X used?'. Self-definitions are excluded.",
+     "inputSchema": {"type": "object",
+                     "properties": {"path": {"type": "string",
+                                             "description": "File path where the symbol is defined (as ingested)"},
+                                    "simbolo": {"type": "string",
+                                                "description": "Symbol name to find references for"},
+                                    "limit": {"type": "integer", "default": 50}},
                      "required": ["path", "simbolo"]}},
 ]
 
@@ -168,10 +192,23 @@ def _text_of(item: dict) -> str:
 
 # ── Camada de código: frescor sem sync GitHub ───────────────────────────────
 def _code_root():
-    if not CODE_ROOT:
-        return None
-    r = os.path.abspath(os.path.expanduser(CODE_ROOT))
-    return r if os.path.isdir(r) else None
+    """Raiz do código do projeto. Ordem: CM_CODE_ROOT explícito → auto-detect
+    (sobe do cwd até achar .git — o cliente roda o SDK dentro do repo dele e o
+    Cube ingere sozinho, sem setup). Retorna None se nada encontrado."""
+    if CODE_ROOT:
+        r = os.path.abspath(os.path.expanduser(CODE_ROOT))
+        if os.path.isdir(r):
+            return r
+    # auto-detect: sobe até 8 níveis procurando .git
+    d = os.path.abspath(os.getcwd())
+    for _ in range(9):
+        if os.path.isdir(os.path.join(d, ".git")) or os.path.isfile(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
 
 
 def _iter_code_files(root):
@@ -332,8 +369,15 @@ def call_tool(name: str, args: dict) -> str:
         mid = args.get("id")
         if not mid:
             return "Error: id is required."
-        st, _ = _request("DELETE", f"/v1/memory/{mid}")
-        return "Deleted." if st == 200 else f"Error: HTTP {st}"
+        # Fase 1: fechar vigência (soft), não deletar físico. A memória some da
+        # busca mas continua legível por id (auditoria).
+        st, _ = _request("POST", f"/v1/memory/{mid}/close",
+                         {"motivo": args.get("motivo", "removida")})
+        if st == 200:
+            return "Memory closed (removed from recall; still readable by id)."
+        if st == 404:
+            return "Memory not found."
+        return f"Error: HTTP {st}"
 
     if name == "search_code":
         payload = {"query": args.get("query", ""), "limit": args.get("limit", 5)}
@@ -384,6 +428,34 @@ def call_tool(name: str, args: dict) -> str:
             head += f"  [+{(body or {}).get('total', 1) - 1} other definition(s) same name]"
         return f"{head}\n\n{m0.get('corpo', '')}"
 
+    if name == "get_symbol_refs":
+        path = (args.get("path") or "").strip()
+        simbolo = (args.get("simbolo") or args.get("symbol") or "").strip()
+        if not path or not simbolo:
+            return "Error: path and simbolo are required."
+        _ensure_fresh(path)
+        payload = {"path": path, "simbolo": simbolo, "limit": args.get("limit", 50)}
+        st, body = _request("POST", "/v1/code/refs", payload)
+        if st == 404:
+            return f"Symbol not found: {simbolo} in {path}"
+        if st != 200:
+            return f"Error: HTTP {st}"
+        matches = (body or {}).get("matches", [])
+        if not matches:
+            return (f"{simbolo} em {path}: nenhum uso encontrado no projeto "
+                    f"(0 referências).")
+        total = (body or {}).get("total", len(matches))
+        out = [f"{simbolo} em {path} é usado em {total} ponto(s)"
+               + (" (truncado)" if (body or {}).get("truncado") else "") + ":"]
+        cur = None
+        for i, h in enumerate(matches, 1):
+            ref = f"{h.get('caminho')}:{h.get('linha')}  em {h.get('simbolo')} ({h.get('kind')})"
+            if ref != cur:
+                out.append(f"[{i}] {ref}")
+                cur = ref
+            out.append(f"      {h.get('trecho', '')}")
+        return "\n".join(out)
+
     return f"Unknown tool: {name}"
 
 
@@ -413,9 +485,16 @@ def main():
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "cube-memory", "version": "1.2"}}})
+                "serverInfo": {"name": "cube-memory", "version": "1.3"}}})
         elif method == "notifications/initialized":
-            pass
+            # SessionStart: sync automático do código do projeto. O cliente só
+            # precisa rodar o SDK dentro do repo (ou CM_CODE_ROOT) — a raiz é
+            # auto-detectada e o delta-ingest acontece sozinho, sem setup.
+            try:
+                if _code_root():
+                    sync_code()
+            except Exception:
+                pass  # best-effort: nunca derruba a sessão por sync
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
         elif method == "tools/call":
