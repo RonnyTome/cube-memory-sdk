@@ -93,10 +93,11 @@ if (not API_KEY or not PID):
 
 TOOLS = [
     {"name": "search_memory",
-     "description": "Recall relevant memories before responding. Call this first with the user's message.",
+     "description": "Recall relevant memories before responding. Call this first with the user's message. Optional `escopo` narrows the search ('universal' | 'projeto:<id>' | 'cena:<id>', or a list); default = universal + this project.",
      "inputSchema": {"type": "object",
                      "properties": {"query": {"type": "string"},
-                                    "limit": {"type": "integer", "default": 5}},
+                                    "limit": {"type": "integer", "default": 5},
+                                    "escopo": {"description": "scope filter"}},
                      "required": ["query"]}},
     {"name": "fetch_memory",
      "description": "Fetch the full text of specific memories by id (ids come from search_memory).",
@@ -104,12 +105,14 @@ TOOLS = [
                      "properties": {"ids": {"type": "array", "items": {"type": "string"}}},
                      "required": ["ids"]}},
     {"name": "store_memory",
-     "description": "Save a memory. Point at the source of truth instead of copying it; if it overlaps an existing memory, update that one instead of appending a second copy.",
+     "description": "Save a memory. Point at the source of truth instead of copying it; if it overlaps an existing memory, update that one instead of appending a second copy. Optional `tipo` (semantica|episodica|procedural|preferencia|entidade|projeto|coletiva | 'auto') and `escopo` ('universal' default | 'projeto:<id>' | 'cena:<id>').",
      "inputSchema": {"type": "object",
                      "properties": {"text": {"type": "string"},
                                     "layer": {"type": "string",
                                               "enum": ["short-term", "mid-term", "long-term"],
-                                              "default": "long-term"}},
+                                              "default": "long-term"},
+                                    "tipo": {"type": "string"},
+                                    "escopo": {"type": "string"}},
                      "required": ["text"]}},
     {"name": "list_memory",
      "description": "List stored memories, most recent first.",
@@ -319,8 +322,10 @@ def sync_code() -> str:
 
 def call_tool(name: str, args: dict) -> str:
     if name == "search_memory":
-        st, body = _request("POST", "/v1/memory/search",
-                            {"query": args["query"], "limit": args.get("limit", 5)})
+        _p = {"query": args["query"], "limit": args.get("limit", 5)}
+        if args.get("escopo"):
+            _p["escopo"] = args["escopo"]
+        st, body = _request("POST", "/v1/memory/search", _p)
         if st != 200:
             return f"Error: HTTP {st}"
         results = (body or {}).get("results", [])
@@ -349,8 +354,12 @@ def call_tool(name: str, args: dict) -> str:
         if not text:
             return "Error: text is required."
         mid = f"mem_{hashlib.sha1(f'{text}{time.time()}'.encode()).hexdigest()[:10]}"
-        st, body = _request("POST", "/v1/memory",
-                            {"id": mid, "text": text, "layer": args.get("layer", "long-term")})
+        _p = {"id": mid, "text": text, "layer": args.get("layer", "long-term")}
+        if args.get("tipo"):
+            _p["tipo"] = args["tipo"]
+        if args.get("escopo"):
+            _p["escopo"] = args["escopo"]
+        st, body = _request("POST", "/v1/memory", _p)
         if st != 200:
             return f"Error: HTTP {st}"
         return f"Memory stored (id={(body or {}).get('id', mid)}). Indexing is async — allow a few seconds before recall."
