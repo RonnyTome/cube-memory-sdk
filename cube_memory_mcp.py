@@ -185,6 +185,19 @@ def _request(method: str, path: str, payload=None):
             body = r.read().decode("utf-8")
             return r.status, (json.loads(body) if body.strip() else None)
     except urllib.error.HTTPError as e:
+        # Nao descartar o corpo: o gateway devolve JSON-RPC/JSON com a mensagem
+        # real (ex.: "Invalid API Key" + orientacao). Cliente so com o codigo
+        # HTTP nao consegue diagnosticar instalacao.
+        raw = b""
+        try:
+            raw = e.read()
+        except Exception:
+            pass
+        if raw.strip():
+            try:
+                return e.code, json.loads(raw.decode("utf-8"))
+            except Exception:
+                return e.code, {"_error": raw.decode("utf-8", "replace")[:300]}
         return e.code, None
     except urllib.error.URLError as e:
         return 0, {"_error": str(e.reason)}
