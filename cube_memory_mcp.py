@@ -29,9 +29,20 @@ Or the hosted endpoint, no local file:
     }
   }
 
-Tools: search_memory, fetch_memory, store_memory, list_memory, forget_memory.
+Tools: search_memory, fetch_memory, store_memory, list_memory, forget_memory,
+       search_code, map_code, get_symbol.
 `list_memories` is accepted as an alias of `list_memory` for backward
 compatibility with builds of this file published before 2026-09-03.
+
+Code layer (v1.2): the project's code can be ingested server-side (per-symbol
+parse) and queried with search_code / map_code / get_symbol. Freshness without
+GitHub sync:
+  - `python3 cube_memory_mcp.py sync` — delta-ingest: hashes every code file
+    under CM_CODE_ROOT, asks the server what changed, re-ingests only that.
+    Wire it to a SessionStart hook to keep the index always fresh.
+  - map_code / get_symbol self-heal: if CM_CODE_ROOT is set and the local file
+    differs from what was indexed, that one file is re-ingested before answering.
+  - every code answer carries the indexing age; stale ones are flagged.
 """
 import hashlib
 import json
@@ -45,6 +56,17 @@ BASE    = os.getenv("CM_BASE_URL", "https://cubememory.com.br/gateway")
 API_KEY = os.getenv("CM_API_KEY") or os.getenv("OMNIBUS_API_KEY", "")
 PID     = os.getenv("CM_PROJECT_ID") or os.getenv("CUBE_PROJECT_ID", "")
 TIMEOUT = float(os.getenv("CM_TIMEOUT", "30"))
+
+# Raiz do código do projeto na máquina do cliente — habilita sync_code e a
+# auto-cura (lazy re-ingest). Sem isto, o SDK ainda funciona: só não detecta
+# mudança local (respostas vêm carimbadas com a idade da indexação).
+CODE_ROOT   = os.getenv("CM_CODE_ROOT", "")
+CODE_STALE_H = float(os.getenv("CM_CODE_STALE_H", "24"))
+_CODE_EXT   = (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+_CODE_SKIP  = {"node_modules", ".git", ".next", "__pycache__", "dist", "build",
+               ".venv", "venv", ".mypy_cache", ".pytest_cache", "coverage"}
+_CODE_MAX_FILE  = 2 * 1024 * 1024
+_CODE_BATCH_MAX = 4 * 1024 * 1024   # < cap de 5 MB do servidor, com folga
 
 # Fallback: config.json gravado pelo instalador (install.sh / install.ps1).
 # Caminhos: Linux/macOS ~/.cube-memory/config.json ; Windows %USERPROFILE%\.cube-memory\config.json
@@ -93,6 +115,32 @@ TOOLS = [
      "inputSchema": {"type": "object",
                      "properties": {"id": {"type": "string"}},
                      "required": ["id"]}},
+    {"name": "search_code",
+     "description": "Semantic search inside the project's ingested code symbols "
+                    "(functions/classes/methods). Use for 'where is X implemented', "
+                    "'which function handles Y'. Returns file path + line range per hit, "
+                    "with the indexing age.",
+     "inputSchema": {"type": "object",
+                     "properties": {"query": {"type": "string"},
+                                    "limit": {"type": "integer", "default": 5},
+                                    "path": {"type": "string",
+                                             "description": "Optional: one file path"}},
+                     "required": ["query"]}},
+    {"name": "map_code",
+     "description": "Skeleton of one ingested code file: every symbol with its line "
+                    "range. Use instead of reading the whole file when you only need to "
+                    "know WHERE to look. Self-heals against the local file if CM_CODE_ROOT is set.",
+     "inputSchema": {"type": "object",
+                     "properties": {"path": {"type": "string"}},
+                     "required": ["path"]}},
+    {"name": "get_symbol",
+     "description": "Full body of ONE symbol (function/class/method) from an ingested "
+                    "file. Read only the piece you need. Self-heals against the local "
+                    "file if CM_CODE_ROOT is set; always reports the indexing age.",
+     "inputSchema": {"type": "object",
+                     "properties": {"path": {"type": "string"},
+                                    "simbolo": {"type": "string"}},
+                     "required": ["path", "simbolo"]}},
 ]
 
 
@@ -116,6 +164,120 @@ def _request(method: str, path: str, payload=None):
 
 def _text_of(item: dict) -> str:
     return item.get("text") or item.get("text_preview") or ""
+
+
+# ── Camada de código: frescor sem sync GitHub ───────────────────────────────
+def _code_root():
+    if not CODE_ROOT:
+        return None
+    r = os.path.abspath(os.path.expanduser(CODE_ROOT))
+    return r if os.path.isdir(r) else None
+
+
+def _iter_code_files(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _CODE_SKIP and not d.startswith(".")]
+        for fn in filenames:
+            if not fn.endswith(_CODE_EXT):
+                continue
+            ap = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(ap) > _CODE_MAX_FILE:
+                    continue
+            except OSError:
+                continue
+            rel = os.path.relpath(ap, root).replace(os.sep, "/")
+            yield rel, ap
+
+
+def _sha256_file(ap):
+    h = hashlib.sha256()
+    try:
+        with open(ap, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _age_note(indexed_at) -> str:
+    if not indexed_at:
+        return "(indexing age unknown)"
+    h = (time.time() - float(indexed_at)) / 3600.0
+    base = f"indexed {h:.1f}h ago" if h >= 1 else f"indexed {h * 60:.0f}min ago"
+    return base + ("  ⚠ possibly stale — file may have changed since" if h > CODE_STALE_H else "")
+
+
+def _ingest_paths(root, rels) -> tuple:
+    """Ingesta uma lista de paths relativos em lotes < cap do servidor."""
+    sent = 0
+    batch, size = [], 0
+    def flush():
+        nonlocal batch, size
+        if not batch:
+            return
+        _request("POST", "/v1/code/ingest", {"files": batch})
+        batch, size = [], 0
+    for rel in rels:
+        ap = os.path.join(root, rel)
+        try:
+            content = open(ap, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        b = len(content.encode("utf-8", "replace"))
+        if size + b > _CODE_BATCH_MAX or len(batch) >= 180:
+            flush()
+        batch.append({"path": rel, "content": content})
+        size += b
+        sent += 1
+    flush()
+    return sent
+
+
+def _ensure_fresh(path: str):
+    """Auto-cura (§5.2): se a raiz local existe e o arquivo difere do indexado,
+    re-ingesta esse arquivo antes de responder. No-op sem CM_CODE_ROOT."""
+    root = _code_root()
+    if not root:
+        return
+    ap = os.path.join(root, path.replace("/", os.sep))
+    if not os.path.isfile(ap):
+        return
+    sha = _sha256_file(ap)
+    if not sha:
+        return
+    st, body = _request("POST", "/v1/code/manifest", {"files": [{"path": path, "sha256": sha}]})
+    if st != 200 or not body:
+        return
+    if path in (body.get("stale") or []) or path in (body.get("missing") or []):
+        _ingest_paths(root, [path])
+
+
+def sync_code() -> str:
+    """Delta-ingest (§5.1): hash de cada arquivo sob CM_CODE_ROOT → o servidor diz
+    o que mudou → re-ingesta só isso. Também remove do índice o que sumiu."""
+    root = _code_root()
+    if not root:
+        return ("CM_CODE_ROOT não definido (ou não é um diretório). "
+                "Defina para o diretório do projeto para habilitar o sync.")
+    manifest = [{"path": rel, "sha256": _sha256_file(ap)}
+                for rel, ap in _iter_code_files(root)]
+    if not manifest:
+        return f"Nenhum arquivo de código encontrado sob {root}."
+    st, body = _request("POST", "/v1/code/manifest", {"files": manifest})
+    if st != 200 or body is None:
+        return f"Error: /v1/code/manifest HTTP {st}"
+    stale = body.get("stale") or []
+    missing = body.get("missing") or []
+    deleted = body.get("deleted") or []
+    todo = missing + stale
+    n = _ingest_paths(root, todo) if todo else 0
+    if deleted:
+        _request("POST", "/v1/code/forget", {"paths": deleted})
+    return (f"sync: {len(manifest)} arquivo(s) escaneado(s); "
+            f"{len(missing)} novo(s), {len(stale)} alterado(s) re-ingerido(s) ({n}); "
+            f"{len(deleted)} removido(s); {body.get('ok', 0)} já em dia.")
 
 
 def call_tool(name: str, args: dict) -> str:
@@ -173,6 +335,55 @@ def call_tool(name: str, args: dict) -> str:
         st, _ = _request("DELETE", f"/v1/memory/{mid}")
         return "Deleted." if st == 200 else f"Error: HTTP {st}"
 
+    if name == "search_code":
+        payload = {"query": args.get("query", ""), "limit": args.get("limit", 5)}
+        if args.get("path"):
+            payload["path"] = args["path"]
+        st, body = _request("POST", "/v1/code/search", payload)
+        if st != 200:
+            return f"Error: HTTP {st}"
+        res = (body or {}).get("results", [])
+        if not res:
+            return "No matching code symbols. (Run `cube_memory_mcp.py sync` to ingest code.)"
+        return "\n".join(
+            f"[{i}] {h.get('caminho')}:{h.get('linha_ini')}-{h.get('linha_fim')}  "
+            f"{h.get('simbolo')} ({h.get('kind')})  score {float(h.get('score', 0)):.3f}  "
+            f"{_age_note(h.get('indexed_at'))}\n    {h.get('assinatura', '')}"
+            for i, h in enumerate(res, 1))
+
+    if name == "map_code":
+        path = (args.get("path") or "").strip()
+        if not path:
+            return "Error: path is required."
+        _ensure_fresh(path)
+        st, body = _request("POST", "/v1/code/map", {"path": path})
+        if st == 404:
+            return f"File not indexed: {path}"
+        if st != 200:
+            return f"Error: HTTP {st}"
+        return f"{(body or {}).get('mapa', '')}\n\n({_age_note((body or {}).get('indexed_at'))})"
+
+    if name == "get_symbol":
+        path = (args.get("path") or "").strip()
+        simbolo = (args.get("simbolo") or args.get("symbol") or "").strip()
+        if not path or not simbolo:
+            return "Error: path and simbolo are required."
+        _ensure_fresh(path)
+        st, body = _request("POST", "/v1/code/symbol", {"path": path, "simbolo": simbolo})
+        if st == 404:
+            return f"Symbol not found: {simbolo} in {path}"
+        if st != 200:
+            return f"Error: HTTP {st}"
+        matches = (body or {}).get("matches", [])
+        if not matches:
+            return f"Symbol not found: {simbolo} in {path}"
+        m0 = matches[0]
+        head = (f"{m0.get('caminho')}:{m0.get('linha_ini')}-{m0.get('linha_fim')}  "
+                f"{m0.get('simbolo')} ({m0.get('kind')})  {_age_note(m0.get('indexed_at'))}")
+        if (body or {}).get("ambiguo"):
+            head += f"  [+{(body or {}).get('total', 1) - 1} other definition(s) same name]"
+        return f"{head}\n\n{m0.get('corpo', '')}"
+
     return f"Unknown tool: {name}"
 
 
@@ -185,6 +396,10 @@ def main():
     if not API_KEY or not PID:
         sys.stderr.write("Error: set CM_API_KEY and CM_PROJECT_ID env vars\n")
         sys.exit(1)
+    # `cube_memory_mcp.py sync` — delta-ingest do código (wire num SessionStart hook)
+    if len(sys.argv) > 1 and sys.argv[1] in ("sync", "sync-code", "code-sync"):
+        sys.stdout.write(sync_code() + "\n")
+        sys.exit(0)
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -198,7 +413,7 @@ def main():
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "cube-memory", "version": "1.1"}}})
+                "serverInfo": {"name": "cube-memory", "version": "1.2"}}})
         elif method == "notifications/initialized":
             pass
         elif method == "tools/list":
