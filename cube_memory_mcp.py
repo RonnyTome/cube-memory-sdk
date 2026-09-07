@@ -99,6 +99,12 @@ TOOLS = [
                                     "limit": {"type": "integer", "default": 5},
                                     "escopo": {"description": "scope filter"}},
                      "required": ["query"]}},
+    {"name": "search_context",
+     "description": "Search all project context, including uploaded documents, notes, memories and indexed code symbols.",
+     "inputSchema": {"type": "object",
+                     "properties": {"query": {"type": "string"},
+                                    "limit": {"type": "integer", "default": 8}},
+                     "required": ["query"]}},
     {"name": "fetch_memory",
      "description": "Fetch the full text of specific memories by id (ids come from search_memory).",
      "inputSchema": {"type": "object",
@@ -335,6 +341,22 @@ def sync_code() -> str:
 
 
 def call_tool(name: str, args: dict) -> str:
+    if name == "search_context":
+        st, body = _request("POST", "/v1/indexes/search", {
+            "query": args["query"], "limit": args.get("limit", 8),
+            "engine": "exact", "decay": False, "preview_chars": 2000,
+        })
+        if st != 200:
+            return f"Error: HTTP {st}"
+        results = (body or {}).get("results", [])
+        if not results:
+            return "No relevant project context found."
+        return "\n".join(
+            f"[{i}] [{x.get('index','context')}:{(x.get('metadata') or {}).get('filename') or x.get('id')}] "
+            f"(score {float(x.get('score', 0)):.3f}) {x.get('text_preview','')}"
+            for i, x in enumerate(results, 1)
+        )
+
     if name == "search_memory":
         _p = {"query": args["query"], "limit": args.get("limit", 5)}
         if args.get("escopo"):
