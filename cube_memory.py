@@ -54,6 +54,43 @@ class Memory:
 
     # ── core ──────────────────────────────────────────────────────────────────
 
+    def checkpoint(self, workflow_id: str, **checkpoint) -> dict:
+        """Save a versioned checkpoint; expected_revision=0 creates it.
+
+        Retry with the same request_id and identical body after a timeout.
+        A completed action requires source/content evidence; this records the
+        caller's evidence and does not independently verify the external action.
+        """
+        from urllib.parse import quote
+        r = _req.put(f"{self._base}/v1/workflows/{quote(workflow_id, safe='')}/checkpoint",
+                     headers=self._h, json=checkpoint, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def resume(self, workflow_id: str) -> dict:
+        """Fetch pending work after interruption; read before issuing new actions."""
+        from urllib.parse import quote
+        r = _req.get(f"{self._base}/v1/workflows/{quote(workflow_id, safe='')}/resume",
+                     headers=self._h, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def list_work(self, limit: int = 50) -> list:
+        r = _req.get(f"{self._base}/v1/workflows", headers=self._h,
+                     params={'limit': limit}, timeout=30)
+        r.raise_for_status()
+        return r.json()['workflows']
+
+    def ingest_tracked(self, workflow_id: str, index_name: str, documents: list,
+                       request_id: str) -> dict:
+        """Ingest a batch with a persisted trace. Reuse IDs/body on retries."""
+        from urllib.parse import quote
+        r = _req.post(f"{self._base}/v1/workflows/{quote(workflow_id, safe='')}/ingest",
+                      headers=self._h, json={'index_name': index_name,
+                      'documents': documents, 'request_id': request_id}, timeout=120)
+        r.raise_for_status()
+        return r.json()
+
     def remember(self, text: str, layer: str = "short-term", mem_id: Optional[str] = None) -> str:
         """Store a memory. Returns the memory ID."""
         mid = mem_id or f"mem_{hashlib.sha1(f'{text}{time.time()}'.encode()).hexdigest()[:12]}"
